@@ -1,5 +1,7 @@
 """Tests for continuous-profile centroid conversion (unit + API)."""
 
+import math
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -176,6 +178,38 @@ def test_share_of_total_uses_original_unscaled_intensities():
         assert pa.mass == pytest.approx(pb.mass)
 
 
+def test_huge_finite_intensities_do_not_overflow():
+    # Intensities near the float64 limit: 100*I, I*mass and the running
+    # sums would overflow without scaling; every reported value must stay
+    # finite.
+    points = [(100.0, 8e307), (101.0, 1e308), (102.0, 8e307)]
+    res = centroid_profile(points, 0.0, 0.5)
+    assert res.candidate_count == 1
+    peak = res.peaks[0]
+    assert peak.mass == pytest.approx(101.0)
+    assert peak.intensity == pytest.approx(100.0)
+    assert peak.total_intensity_percent == pytest.approx(100.0)
+    for value in (peak.mass, peak.intensity, peak.total_intensity_percent):
+        assert math.isfinite(value)
+
+
+def test_huge_intensities_percentage_split_stays_finite():
+    # Two peaks with huge raw intensities: the scaled accumulation must
+    # still split the total intensity 2:1 between them.
+    levels = [0.0, 1.5e308, 0.0, 0.0, 0.0, 7.5e307, 0.0]
+    points = grid_profile(levels, step=0.1)
+    res = centroid_profile(points, 0.0, 0.2)
+    assert len(res.peaks) == 2
+    strong, weak = res.peaks
+    assert strong.intensity == pytest.approx(100.0)
+    assert weak.intensity == pytest.approx(50.0)
+    assert strong.total_intensity_percent == pytest.approx(200.0 / 3.0)
+    assert weak.total_intensity_percent == pytest.approx(100.0 / 3.0)
+    for peak in res.peaks:
+        for value in (peak.mass, peak.intensity, peak.total_intensity_percent):
+            assert math.isfinite(value)
+
+
 def test_plateau_midpoint_between_grid_points():
     # Even-length plateau (indices 1-2): midpoint lies between grid points.
     points = grid_profile([0.0, 5.0, 5.0, 0.0])
@@ -341,6 +375,30 @@ def test_api_centroid_rounds_to_six_decimals(client):
         for key in ("mass", "intensity", "total_intensity_percent"):
             assert isinstance(peak[key], float)
             assert abs(peak[key] - round(peak[key], 6)) < 1e-12
+
+
+def test_api_centroid_huge_finite_intensities(client):
+    # Raw intensities near the float64 limit must not overflow into
+    # NaN/Infinity anywhere in the pipeline.
+    payload = {
+        "profile": [
+            {"mass": 100.0, "intensity": 8e307},
+            {"mass": 101.0, "intensity": 1e308},
+            {"mass": 102.0, "intensity": 8e307},
+        ],
+        "relative_threshold": 0.0,
+        "min_separation": 0.5,
+    }
+    resp = client.post("/api/v1/profile-centroid", json=payload)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["peak_count"] == 1
+    peak = body["peaks"][0]
+    assert peak["mass"] == pytest.approx(101.0)
+    assert peak["intensity"] == pytest.approx(100.0)
+    assert peak["total_intensity_percent"] == pytest.approx(100.0)
+    for key in ("mass", "intensity", "total_intensity_percent"):
+        assert math.isfinite(peak[key])
 
 
 def test_api_centroid_nms_collapses_close_pair(client):

@@ -103,7 +103,7 @@ def _find_candidates(
         right_lower = j == n - 1 or intensities[j + 1] < level
         if left_lower and right_lower:
             candidates.append(
-                ((masses[i] + masses[j]) / 2.0, 100.0 * level / base, i, j)
+                ((masses[i] + masses[j]) / 2.0, 100.0 * (level / base), i, j)
             )
         i = j + 1
     return candidates
@@ -199,11 +199,13 @@ def centroid_profile(
             "All profile intensities are zero; at least one must be positive",
         )
 
-    # Keep points at or above the base-peak-relative threshold. The tiny
-    # nudge protects the 100.0 base-peak level from binary round-off in the
+    # Keep points at or above the base-peak-relative threshold. The ratio is
+    # formed before multiplying by 100 so that intensities near the float64
+    # limit do not overflow to infinity mid-expression. The tiny nudge
+    # protects the 100.0 base-peak level from binary round-off in the
     # normalisation (100*x/x need not be exactly 100.0).
     kept = [
-        100.0 * value / base + 1e-9 >= relative_threshold
+        100.0 * (value / base) + 1e-9 >= relative_threshold
         for value in intensities
     ]
 
@@ -231,7 +233,12 @@ def centroid_profile(
             winners.append(candidate)
 
     # Assign every above-threshold point to the nearest winner; equidistant
-    # points go to the lower-mass (left) candidate.
+    # points go to the lower-mass (left) candidate. Weights are the original
+    # intensities scaled by the base peak, so every weight lies in [0, 1]:
+    # neither a weight*mass product nor a running sum can overflow to
+    # infinity for raw intensities near the float64 limit, and the centroid
+    # (sum(w*m)/sum(w)) and percentage ratios are invariant to the common
+    # factor.
     winners_by_mass = sorted(winners, key=lambda c: c[0])
     positions = [c[0] for c in winners_by_mass]
     weight_sum = [0.0] * len(winners_by_mass)
@@ -248,7 +255,7 @@ def centroid_profile(
         else:
             left = right - 1
             owner = left if mass - positions[left] <= positions[right] - mass else right
-        weight = intensities[k]
+        weight = intensities[k] / base
         weight_sum[owner] += weight
         weighted_mass_sum[owner] += weight * mass
 

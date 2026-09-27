@@ -258,6 +258,8 @@ curl -X POST http://localhost:8000/api/v1/neutral-profile \
 - `peaks`：每个峰含质心 `mass`（强度加权平均质量）、`intensity`（峰顶相对基峰的归一化强度）与 `total_intensity_percent`（占全部阈值以上分配强度的百分比，所有峰之和为 100），按质量升序。
 - 被 NMS 抑制候选附近的阈值以上点不会丢失，而是照常分配给最近的保留候选，因此保留峰的质心质量可能偏离其峰顶位置。
 
+**大强度数值稳定性**：`intensity` 允许取任何非负有限浮点数（最大约 1.8×10³⁰⁸）。阈值筛选与候选峰强度先计算 `intensity / base` 比值（必在 [0, 1]）再乘 100，避免 `100 × intensity` 在除以同量级基峰之前先溢出为无穷；各峰的原始强度加权质心与占总强度百分比按基峰缩放后的权重累计（质心 Σ(w·m)/Σw 与百分比均为比值，对公共缩放因子不变），乘积与求和都不会溢出。因此质量 100、101、102、强度 8e307、1e308、8e307 的输入仍返回有限的质心（101.0）、归一化强度（100.0）与百分比（100.0）；平台峰判定、最近候选分配与排序规则不受影响。
+
 非法输入返回带字段（必要时带 0 基点索引）的 422：
 
 - 点数不在 3～20000、强度为负或非有限：`error` 为 `invalid_profile`，`field` 为 `profile`（索引问题附 `index`）；
@@ -272,6 +274,29 @@ curl -X POST http://localhost:8000/api/v1/profile-centroid \
   -d '{"relative_threshold":1.0,"min_separation":0.005,
        "profile":[{"mass":100.0,"intensity":0.0},{"mass":100.001,"intensity":60.0},
                   {"mass":100.002,"intensity":100.0},{"mass":100.003,"intensity":60.0}]}'
+```
+
+大强度输入示例（强度接近浮点上界，结果仍为有限值）：
+
+```bash
+curl -X POST http://localhost:8000/api/v1/profile-centroid \
+  -H 'Content-Type: application/json' \
+  -d '{"relative_threshold":0.0,"min_separation":0.5,
+       "profile":[{"mass":100.0,"intensity":8e307},{"mass":101.0,"intensity":1e308},
+                  {"mass":102.0,"intensity":8e307}]}'
+```
+
+```json
+{
+  "point_count": 3,
+  "relative_threshold": 0.0,
+  "min_separation": 0.5,
+  "candidate_count": 1,
+  "peak_count": 1,
+  "peaks": [
+    {"mass": 101.0, "intensity": 100.0, "total_intensity_percent": 100.0}
+  ]
+}
 ```
 
 ### `POST /api/v1/ion-identify`
