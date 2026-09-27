@@ -9,7 +9,9 @@ conversion:
    (every gap must agree with the first gap to within a relative error of
    :data:`STEP_REL_TOLERANCE`), non-negative finite intensities, at least
    one positive intensity.
-2. Intensities are normalised to the base peak (100) and points below
+2. Intensities are normalised to the base peak (100) -- always forming the
+   ratio ``intensity / base`` before the *100 scale so values near the
+   float maximum cannot overflow -- and points below
    ``relative_threshold`` are removed from consideration.
 3. Every flat-topped local-maximum interval (a maximal run of equal
    intensities strictly above its immediate neighbours) becomes one
@@ -20,9 +22,12 @@ conversion:
    discarded.
 5. Every above-threshold point is assigned to the nearest kept candidate
    (ties go to the lower-mass one); each peak's centroid mass is the
-   intensity-weighted mean mass of its assigned points, computed from the
-   original (unnormalised) intensities. Peaks are returned by ascending
-   mass.
+   intensity-weighted mean mass of its assigned points. The weighting uses
+   the original (unnormalised) intensities but accumulates them scaled by
+   the base peak, which keeps every weight in [0, 1] and every running sum
+   finite for legal inputs up to the float maximum; the share-of-total
+   percentage is the ratio of the same scaled sums. Peaks are returned by
+   ascending mass.
 """
 
 from __future__ import annotations
@@ -102,11 +107,40 @@ def _find_candidates(
         left_lower = i == 0 or intensities[i - 1] < level
         right_lower = j == n - 1 or intensities[j + 1] < level
         if left_lower and right_lower:
+            # Divide by the base peak before the *100 scale: a level near
+            # the float maximum would make 100*level overflow before the
+            # same-magnitude division rescaled it.
             candidates.append(
-                ((masses[i] + masses[j]) / 2.0, 100.0 * level / base, i, j)
+                ((masses[i] + masses[j]) / 2.0, 100.0 * (level / base), i, j)
             )
         i = j + 1
     return candidates
+
+
+def _centroid_mass(
+    members: list[tuple[float, float]],
+    weighted_mass_sum: float,
+    weight_sum: float,
+) -> float:
+    """Intensity-weighted mean mass of one peak's assigned points.
+
+    ``members`` holds ``(mass, scaled_intensity)`` pairs with intensities
+    already divided by the profile base peak, so every weight lies in
+    [0, 1]; the running sums are then bounded by the point count and stay
+    finite whenever the masses themselves are moderate. The single rescue
+    path below is only reached when ``weighted_mass_sum`` still overflowed
+    (i.e. the masses themselves approach the float maximum): masses are
+    additionally divided by the largest member mass, which bounds every
+    summand at 1 while preserving the same ratio.
+    """
+    if math.isfinite(weighted_mass_sum):
+        return weighted_mass_sum / weight_sum
+    mass_scale = max(abs(mass) for mass, _ in members)
+    scaled_numerator = sum(
+        weight * (mass / mass_scale) for mass, weight in members
+    )
+    scaled_denominator = sum(weight for _, weight in members)
+    return mass_scale * (scaled_numerator / scaled_denominator)
 
 
 def centroid_profile(
@@ -199,11 +233,14 @@ def centroid_profile(
             "All profile intensities are zero; at least one must be positive",
         )
 
-    # Keep points at or above the base-peak-relative threshold. The tiny
-    # nudge protects the 100.0 base-peak level from binary round-off in the
-    # normalisation (100*x/x need not be exactly 100.0).
+    # Keep points at or above the base-peak-relative threshold. The ratio
+    # is formed before the *100 scale: a value near the float maximum
+    # (up to ~1.8e308) would overflow in 100*value before the same-order
+    # division by base rescaled it. The tiny nudge protects the 100.0
+    # base-peak level from binary round-off in the normalisation
+    # (100*x/x need not be exactly 100.0).
     kept = [
-        100.0 * value / base + 1e-9 >= relative_threshold
+        100.0 * (value / base) + 1e-9 >= relative_threshold
         for value in intensities
     ]
 
@@ -231,11 +268,17 @@ def centroid_profile(
             winners.append(candidate)
 
     # Assign every above-threshold point to the nearest winner; equidistant
-    # points go to the lower-mass (left) candidate.
+    # points go to the lower-mass (left) candidate. Intensities are scaled
+    # by the base peak as they accumulate: each weight is then in [0, 1] and
+    # neither the weight sums nor the mass-weighted products can overflow
+    # for original intensities as large as the float maximum.
     winners_by_mass = sorted(winners, key=lambda c: c[0])
     positions = [c[0] for c in winners_by_mass]
     weight_sum = [0.0] * len(winners_by_mass)
     weighted_mass_sum = [0.0] * len(winners_by_mass)
+    members: list[list[tuple[float, float]]] = [
+        [] for _ in winners_by_mass
+    ]
     for k in range(n):
         if not kept[k]:
             continue
@@ -248,17 +291,25 @@ def centroid_profile(
         else:
             left = right - 1
             owner = left if mass - positions[left] <= positions[right] - mass else right
-        weight = intensities[k]
+        weight = intensities[k] / base
         weight_sum[owner] += weight
         weighted_mass_sum[owner] += weight * mass
+        members[owner].append((mass, weight))
 
+    # Scaled sums total the same proportion as the original intensity sum,
+    # so the share-of-total percentage is unaffected by the rescaling (and
+    # its numerator/denominator can no longer overflow to inf/inf = NaN).
     total_assigned = sum(weight_sum)
     peaks: list[CentroidPeak] = []
     for owner, candidate in enumerate(winners_by_mass):
         _, level, _, _ = candidate
         peaks.append(
             CentroidPeak(
-                mass=weighted_mass_sum[owner] / weight_sum[owner],
+                mass=_centroid_mass(
+                    members[owner],
+                    weighted_mass_sum[owner],
+                    weight_sum[owner],
+                ),
                 intensity=level,
                 total_intensity_percent=100.0 * weight_sum[owner] / total_assigned,
             )
